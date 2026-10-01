@@ -1,514 +1,185 @@
-# DRIVER MONITORING SYSTEM (ADAS-LIKE)
-# Part 1
+# DRIVER MONITORING SYSTEM - Streamlit Cloud version
 
-# IMPORTS
-
-import cv2
-import mediapipe as mp
-import numpy as np
-import winsound
+import os
 import time
+import threading
+
+import av
+import cv2
+import numpy as np
+import streamlit as st
+import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from streamlit_webrtc import webrtc_streamer
 
 # CONFIGURATION
 
-MODEL_PATH = r"C:\Users\mounilka\OneDrive\Desktop\demo\face_landmarker.task"
+# model file must sit in the repo next to app.py
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 
-# Eye thresholds
 EAR_THRESHOLD = 0.20
 BLINK_THRESHOLD = 0.70
-
-# Yawning threshold
 MAR_THRESHOLD = 0.60
-
-# Time thresholds
 DROWSY_TIME = 1.5
 MICROSLEEP_TIME = 3.0
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-
-##############################
-# ALARM FUNCTIONS
-##############################
-
-alarm_playing = False
-
-
-def play_alarm():
-    global alarm_playing
-
-    if not alarm_playing:
-        winsound.Beep(2500, 1000)
-        alarm_playing = True
-
-
-def stop_alarm():
-    global alarm_playing
-    alarm_playing = False
-
-
-##############################
-# MEDIAPIPE INITIALIZATION
-##############################
-
-base_options = python.BaseOptions(
-    model_asset_path=MODEL_PATH
-)
-
-options = vision.FaceLandmarkerOptions(
-    base_options=base_options,
-    output_face_blendshapes=True,
-    output_facial_transformation_matrixes=True,
-    num_faces=1
-)
-
-detector = vision.FaceLandmarker.create_from_options(options)
-
-
-##############################
-# LANDMARK INDICES
-##############################
-
-# Eyes
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-
-# Iris
 LEFT_IRIS = [468, 469, 470, 471]
 RIGHT_IRIS = [473, 474, 475, 476]
+UPPER_LIP, LOWER_LIP, LEFT_MOUTH, RIGHT_MOUTH = 13, 14, 78, 308
+NOSE, CHIN = 1, 152
 
-# Mouth
-UPPER_LIP = 13
-LOWER_LIP = 14
-LEFT_MOUTH = 78
-RIGHT_MOUTH = 308
-
-# Face
-NOSE = 1
-CHIN = 152
-
-
-##############################
-# HELPER FUNCTIONS
-##############################
 
 def distance(p1, p2):
     return np.linalg.norm(np.array(p1) - np.array(p2))
 
 
 def compute_ear(eye):
-    A = distance(eye[1], eye[5])
-    B = distance(eye[2], eye[4])
-    C = distance(eye[0], eye[3])
-
-    return (A + B) / (2 * C)
-
-
-def compute_mar(landmarks):
-
-    upper = np.array([
-        landmarks[UPPER_LIP].x,
-        landmarks[UPPER_LIP].y
-    ])
-
-    lower = np.array([
-        landmarks[LOWER_LIP].x,
-        landmarks[LOWER_LIP].y
-    ])
-
-    left = np.array([
-        landmarks[LEFT_MOUTH].x,
-        landmarks[LEFT_MOUTH].y
-    ])
-
-    right = np.array([
-        landmarks[RIGHT_MOUTH].x,
-        landmarks[RIGHT_MOUTH].y
-    ])
-
-    vertical = np.linalg.norm(upper - lower)
-    horizontal = np.linalg.norm(left - right)
-
-    mar = vertical / horizontal
-
-    return mar
+    a = distance(eye[1], eye[5])
+    b = distance(eye[2], eye[4])
+    c = distance(eye[0], eye[3])
+    return (a + b) / (2 * c)
 
 
-def iris_center(landmarks, indices):
+def compute_mar(lm):
+    vertical = distance((lm[UPPER_LIP].x, lm[UPPER_LIP].y), (lm[LOWER_LIP].x, lm[LOWER_LIP].y))
+    horizontal = distance((lm[LEFT_MOUTH].x, lm[LEFT_MOUTH].y), (lm[RIGHT_MOUTH].x, lm[RIGHT_MOUTH].y))
+    return vertical / max(horizontal, 1e-6)
 
-    pts = []
 
-    for idx in indices:
-        pts.append([
-            landmarks[idx].x,
-            landmarks[idx].y
-        ])
-
-    pts = np.array(pts)
-
+def iris_center(lm, indices):
+    pts = np.array([[lm[i].x, lm[i].y] for i in indices])
     return np.mean(pts, axis=0)
 
 
-##############################
-# STATE VARIABLES
-##############################
+class DriverMonitor:
+    """Runs in webrtc worker thread. All state lives here, not in globals."""
 
-closed_start = None
+    def __init__(self):
+        options = vision.FaceLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
+            output_face_blendshapes=True,
+            num_faces=1,
+        )
+        self.detector = vision.FaceLandmarker.create_from_options(options)
+        self.lock = threading.Lock()
+        self.closed_start = None
+        self.closed_frames = 0
+        self.total_frames = 0
 
-closed_frames = 0
-total_frames = 0
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)
 
-state = "NORMAL"
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-start_time = time.time()
+        with self.lock:
+            results = self.detector.detect(mp_image)
+            self.total_frames += 1
 
+            if not results.face_landmarks:
+                self.closed_start = None
+                cv2.putText(img, "NO FACE", (20, 40), FONT, 1, (0, 0, 255), 2)
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-##############################
-# CAMERA INITIALIZATION
-##############################
+            lm = results.face_landmarks[0]
 
-cap = cv2.VideoCapture(0)
+            # EAR
+            left_eye = [(lm[i].x, lm[i].y) for i in LEFT_EYE]
+            right_eye = [(lm[i].x, lm[i].y) for i in RIGHT_EYE]
+            avg_ear = (compute_ear(left_eye) + compute_ear(right_eye)) / 2
 
-if not cap.isOpened():
-    print("Cannot open camera")
-    exit()
+            # Blendshapes
+            left_blink = right_blink = 0
+            if results.face_blendshapes:
+                for item in results.face_blendshapes[0]:
+                    if item.category_name == "eyeBlinkLeft":
+                        left_blink = item.score
+                    elif item.category_name == "eyeBlinkRight":
+                        right_blink = item.score
 
-
-##############################
-# MAIN LOOP
-##############################
-
-while True:
-
-    success, frame = cap.read()
-
-    if not success:
-        break
-
-    frame = cv2.flip(frame, 1)
-
-    h, w, _ = frame.shape
-
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    mp_image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=rgb
-    )
-
-    results = detector.detect(mp_image)
-
-    total_frames += 1
-
-    if results.face_landmarks:
-
-        landmarks = results.face_landmarks[0]
-
-        ################################################
-        # EXTRACT LEFT EYE
-        ################################################
-
-        left_eye = []
-
-        for idx in LEFT_EYE:
-            left_eye.append(
-                (
-                    landmarks[idx].x,
-                    landmarks[idx].y
-                )
+            eye_closed = avg_ear < EAR_THRESHOLD or (
+                left_blink > BLINK_THRESHOLD and right_blink > BLINK_THRESHOLD
             )
 
-        ################################################
-        # EXTRACT RIGHT EYE
-        ################################################
+            duration = 0.0
+            if eye_closed:
+                self.closed_frames += 1
+                if self.closed_start is None:
+                    self.closed_start = time.time()
+                duration = time.time() - self.closed_start
+            else:
+                self.closed_start = None
 
-        right_eye = []
+            if duration > MICROSLEEP_TIME:
+                state = "MICROSLEEP"
+            elif duration > DROWSY_TIME:
+                state = "DROWSY"
+            else:
+                state = "NORMAL"
 
-        for idx in RIGHT_EYE:
-            right_eye.append(
-                (
-                    landmarks[idx].x,
-                    landmarks[idx].y
-                )
-            )
+            # Yawn
+            mar = compute_mar(lm)
+            yawning = mar > MAR_THRESHOLD
 
-        ################################################
-        # EAR CALCULATION
-        ################################################
+            # Gaze
+            gaze_x = (iris_center(lm, LEFT_IRIS)[0] + iris_center(lm, RIGHT_IRIS)[0]) / 2
+            gaze = "FORWARD"
+            if gaze_x < 0.42:
+                gaze = "LOOKING LEFT"
+            elif gaze_x > 0.58:
+                gaze = "LOOKING RIGHT"
 
-        left_ear = compute_ear(left_eye)
-        right_ear = compute_ear(right_eye)
+            # Head down / phone
+            head_down = (lm[CHIN].y - lm[NOSE].y) < 0.18
+            phone = head_down and (0.45 < gaze_x < 0.55)
 
-        avg_ear = (left_ear + right_ear) / 2
+            perclos = self.closed_frames / max(self.total_frames, 1) * 100
 
-        ################################################
-        # BLENDSHAPE VALUES
-        ################################################
+        # Draw
+        cv2.putText(img, f"EAR : {avg_ear:.2f}", (20, 40), FONT, 0.7, (0, 255, 0), 2)
+        cv2.putText(img, f"MAR : {mar:.2f}", (20, 80), FONT, 0.7, (255, 255, 0), 2)
+        cv2.putText(img, f"PERCLOS : {perclos:.1f}%", (20, 120), FONT, 0.7, (255, 255, 0), 2)
+        cv2.putText(img, f"Closed Time : {duration:.1f}s", (20, 160), FONT, 0.7, (255, 255, 0), 2)
+        cv2.putText(img, gaze, (20, 200), FONT, 0.7, (255, 255, 255), 2)
 
-        left_blink = 0
-        right_blink = 0
-
-        if results.face_blendshapes:
-
-            blendshapes = results.face_blendshapes[0]
-
-            for item in blendshapes:
-
-                if item.category_name == "eyeBlinkLeft":
-                    left_blink = item.score
-
-                elif item.category_name == "eyeBlinkRight":
-                    right_blink = item.score
-        ################################################
-        # EYE CLOSED DETECTION
-        ################################################
-
-        eye_closed = False
-
-        if avg_ear < EAR_THRESHOLD or (
-            left_blink > BLINK_THRESHOLD and
-            right_blink > BLINK_THRESHOLD
-        ):
-
-            eye_closed = True
-            closed_frames += 1
-
-        ################################################
-        # DROWSINESS TIMER
-        ################################################
-
-        if eye_closed:
-
-            if closed_start is None:
-                closed_start = time.time()
-
-            duration = time.time() - closed_start
-
-        else:
-
-            duration = 0
-            closed_start = None
-            stop_alarm()
-
-        ################################################
-        # DRIVER STATE
-        ################################################
-
-        if duration > MICROSLEEP_TIME:
-
-            state = "MICROSLEEP"
-            play_alarm()
-
-        elif duration > DROWSY_TIME:
-
-            state = "DROWSY"
-            play_alarm()
-
-        else:
-
-            state = "NORMAL"
-
-        ################################################
-        # YAWNING DETECTION
-        ################################################
-
-        mar = compute_mar(landmarks)
-
-        yawn_text = ""
-
-        if mar > MAR_THRESHOLD:
-
-            yawn_text = "YAWNING DETECTED"
-
-        ################################################
-        # GAZE DIRECTION
-        ################################################
-
-        left_iris = iris_center(landmarks, LEFT_IRIS)
-        right_iris = iris_center(landmarks, RIGHT_IRIS)
-
-        gaze_x = (left_iris[0] + right_iris[0]) / 2
-
-        distraction = "FORWARD"
-
-        if gaze_x < 0.42:
-            distraction = "LOOKING LEFT"
-
-        elif gaze_x > 0.58:
-            distraction = "LOOKING RIGHT"
-
-        ################################################
-        # HEAD DOWN DETECTION
-        ################################################
-
-        nose_y = landmarks[NOSE].y
-        chin_y = landmarks[CHIN].y
-
-        head_distance = chin_y - nose_y
-
-        head_down = False
-
-        if head_distance < 0.18:
-
-            head_down = True
-
-        ################################################
-        # PHONE DISTRACTION
-        ################################################
-
-        phone_distraction = False
-
-        if head_down and (0.45 < gaze_x < 0.55):
-
-            phone_distraction = True
-
-        ################################################
-        # PERCLOS
-        ################################################
-
-        perclos = (
-            closed_frames /
-            max(total_frames, 1)
-        ) * 100
-
-        ################################################
-        # DISPLAY VALUES
-        ################################################
-
-        cv2.putText(
-            frame,
-            f"EAR : {avg_ear:.2f}",
-            (20, 40),
-            FONT,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"MAR : {mar:.2f}",
-            (20, 80),
-            FONT,
-            0.7,
-            (255, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"PERCLOS : {perclos:.1f}%",
-            (20, 120),
-            FONT,
-            0.7,
-            (255, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Closed Time : {duration:.1f}s",
-            (20, 160),
-            FONT,
-            0.7,
-            (255, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            distraction,
-            (20, 200),
-            FONT,
-            0.7,
-            (255, 255, 255),
-            2
-        )
-
-        ################################################
-        # WARNINGS
-        ################################################
-
-        if yawn_text != "":
-
-            cv2.putText(
-                frame,
-                yawn_text,
-                (20, 240),
-                FONT,
-                0.8,
-                (0, 0, 255),
-                2
-            )
-
+        if yawning:
+            cv2.putText(img, "YAWNING DETECTED", (20, 240), FONT, 0.8, (0, 0, 255), 2)
         if head_down:
+            cv2.putText(img, "HEAD DOWN", (20, 280), FONT, 0.8, (0, 0, 255), 2)
+        if phone:
+            cv2.putText(img, "PHONE DISTRACTION", (20, 320), FONT, 0.8, (0, 0, 255), 2)
 
-            cv2.putText(
-                frame,
-                "HEAD DOWN",
-                (20, 280),
-                FONT,
-                0.8,
-                (0, 0, 255),
-                2
-            )
+        color = {"NORMAL": (0, 255, 0), "DROWSY": (0, 255, 255)}.get(state, (0, 0, 255))
+        cv2.putText(img, state, (20, 370), FONT, 1, color, 3)
 
-        if phone_distraction:
+        # Visual alarm replaces winsound: red border when drowsy / microsleep
+        if state != "NORMAL":
+            h, w = img.shape[:2]
+            cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 12)
 
-            cv2.putText(
-                frame,
-                "PHONE DISTRACTION",
-                (20, 320),
-                FONT,
-                0.8,
-                (0, 0, 255),
-                2
-            )
-
-        ################################################
-        # DRIVER STATE COLOR
-        ################################################
-
-        if state == "NORMAL":
-            color = (0, 255, 0)
-
-        elif state == "DROWSY":
-            color = (0, 255, 255)
-
-        else:
-            color = (0, 0, 255)
-
-        cv2.putText(
-            frame,
-            state,
-            (20, 370),
-            FONT,
-            1,
-            color,
-            3
-        )
-
-    ####################################################
-    # SHOW WINDOW
-    ####################################################
-
-    cv2.imshow(
-        "Driver Monitoring System",
-        frame
-    )
-
-    key = cv2.waitKey(1)
-
-    if key == 27:
-        break
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
-####################################################
-# CLEANUP
-####################################################
+# STREAMLIT UI
 
-cap.release()
-cv2.destroyAllWindows()
-stop_alarm()
+st.set_page_config(page_title="Driver Monitoring System", layout="centered")
+st.title("Driver Monitoring System")
+st.write("Click START and allow camera access in your browser.")
+
+if not os.path.exists(MODEL_PATH):
+    st.error("face_landmarker.task not found. Add it to the repo next to app.py.")
+    st.stop()
+
+webrtc_streamer(
+    key="driver-monitor",
+    video_processor_factory=DriverMonitor,
+    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    media_stream_constraints={"video": True, "audio": False},
+    async_processing=True,
+)
