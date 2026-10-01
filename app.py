@@ -31,7 +31,7 @@ RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 LEFT_IRIS = [468, 469, 470, 471]
 RIGHT_IRIS = [473, 474, 475, 476]
 UPPER_LIP, LOWER_LIP, LEFT_MOUTH, RIGHT_MOUTH = 13, 14, 78, 308
-NOSE, CHIN = 1, 152
+NOSE, CHIN, FOREHEAD = 1, 152, 10
 
 
 def distance(p1, p2):
@@ -54,6 +54,13 @@ def compute_mar(lm):
 def iris_center(lm, indices):
     pts = np.array([[lm[i].x, lm[i].y] for i in indices])
     return np.mean(pts, axis=0)
+
+
+def gaze_ratio(lm, iris_idx, left_corner, right_corner):
+    """Iris position inside the eye: about 0.5 = looking forward."""
+    iris_x = np.mean([lm[i].x for i in iris_idx])
+    a, b = lm[left_corner].x, lm[right_corner].x
+    return (iris_x - a) / max(b - a, 1e-6)
 
 
 class DriverMonitor:
@@ -128,16 +135,20 @@ class DriverMonitor:
             yawning = mar > MAR_THRESHOLD
 
             # Gaze
-            gaze_x = (iris_center(lm, LEFT_IRIS)[0] + iris_center(lm, RIGHT_IRIS)[0]) / 2
+            g_left = gaze_ratio(lm, LEFT_IRIS, 33, 133)
+            g_right = gaze_ratio(lm, RIGHT_IRIS, 362, 263)
+            gaze_x = (g_left + g_right) / 2
             gaze = "FORWARD"
-            if gaze_x < 0.42:
+            if gaze_x < 0.40:
                 gaze = "LOOKING LEFT"
-            elif gaze_x > 0.58:
+            elif gaze_x > 0.60:
                 gaze = "LOOKING RIGHT"
 
-            # Head down / phone
-            head_down = (lm[CHIN].y - lm[NOSE].y) < 0.18
-            phone = head_down and (0.45 < gaze_x < 0.55)
+            # Head down / phone (relative to face size)
+            face_h = max(lm[CHIN].y - lm[FOREHEAD].y, 1e-6)
+            head_ratio = (lm[CHIN].y - lm[NOSE].y) / face_h
+            head_down = head_ratio < 0.30
+            phone = head_down and (0.40 < gaze_x < 0.60)
 
             perclos = self.closed_frames / max(self.total_frames, 1) * 100
 
@@ -147,6 +158,7 @@ class DriverMonitor:
         cv2.putText(img, f"PERCLOS : {perclos:.1f}%", (20, 120), FONT, 0.7, (255, 255, 0), 2)
         cv2.putText(img, f"Closed Time : {duration:.1f}s", (20, 160), FONT, 0.7, (255, 255, 0), 2)
         cv2.putText(img, gaze, (20, 200), FONT, 0.7, (255, 255, 255), 2)
+        cv2.putText(img, f"HEAD RATIO : {head_ratio:.2f}", (20, 400), FONT, 0.7, (255, 255, 0), 2)
 
         if yawning:
             cv2.putText(img, "YAWNING DETECTED", (20, 240), FONT, 0.8, (0, 0, 255), 2)
